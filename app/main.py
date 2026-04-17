@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import time
 from urllib.parse import urlparse
@@ -90,22 +91,98 @@ def _require_edge_secret(x_memoryan_edge_secret: str | None) -> None:
         raise HTTPException(status_code=401, detail="invalid edge secret")
 
 
+def _first_json_object(s: str) -> dict:
+    """Parse the first top-level JSON object; handles extra text after yt-dlp's dump."""
+    start = s.find("{")
+    if start == -1:
+        return {}
+    depth = 0
+    in_str = False
+    escape = False
+    quote = ""
+    for i in range(start, len(s)):
+        c = s[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == quote:
+                in_str = False
+            continue
+        if c in "\"'":
+            in_str = True
+            quote = c
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                chunk = s[start : i + 1]
+                try:
+                    out = json.loads(chunk)
+                    return out if isinstance(out, dict) else {}
+                except json.JSONDecodeError:
+                    return {}
+    return {}
+
+
 def _extract_json_obj(stdout: str) -> dict:
-    stdout = stdout.strip()
-    if not stdout:
+    if not (stdout or "").strip():
         return {}
-    # yt-dlp may print warnings before JSON; take last {...} block
-    brace = stdout.rfind("{")
-    if brace == -1:
-        return {}
-    chunk = stdout[brace:]
-    try:
-        return json.loads(chunk)
-    except json.JSONDecodeError:
-        return {}
+    s = stdout.strip()
+    # Single-line JSON (common for --dump-single-json)
+    if s.startswith("{") and s.endswith("}"):
+        try:
+            out = json.loads(s)
+            return out if isinstance(out, dict) else {}
+        except json.JSONDecodeError:
+            pass
+    return _first_json_object(s)
+
+
+def _preview_richness(ent: dict) -> int:
+    if not isinstance(ent, dict):
+        return 0
+    n = 0
+    if _pick_title(ent):
+        n += 5
+    if _pick_description(ent):
+        n += 3
+    if _pick_thumb_url(ent):
+        n += 4
+    if ent.get("formats"):
+        n += 1
+    return n
+
+
+def _flatten_playlist_for_preview(info: dict) -> dict:
+    """Use the richest video-like entry when yt-dlp returns a playlist (carousel, etc.)."""
+    if info.get("_type") != "playlist":
+        return info
+    entries = info.get("entries")
+    if not isinstance(entries, list) or not entries:
+        return info
+    dict_entries = [e for e in entries if isinstance(e, dict)]
+    if not dict_entries:
+        return info
+    best = max(dict_entries, key=_preview_richness)
+    merged = {**best}
+    if isinstance(info.get("title"), str) and info["title"].strip() and not _pick_title(merged):
+        merged["title"] = info["title"].strip()
+    if isinstance(info.get("description"), str) and info["description"].strip() and not _pick_description(merged):
+        merged["description"] = info["description"].strip()
+    if not _pick_thumb_url(merged) and _pick_thumb_url(info):
+        if isinstance(info.get("thumbnail"), str):
+            merged["thumbnail"] = info["thumbnail"]
+        elif isinstance(info.get("thumbnails"), list):
+            merged["thumbnails"] = info["thumbnails"]
+    return merged
 
 
 def _run_ytdlp_json(url: str) -> dict:
+    extra = os.getenv("YTDLP_EXTRA_ARGS", "").strip()
     cmd = [
         "yt-dlp",
         "--no-download",
@@ -113,12 +190,28 @@ def _run_ytdlp_json(url: str) -> dict:
         "--skip-download",
         "--dump-single-json",
         "--no-playlist",
+        "--no-check-formats",
         "--retries",
+        "1",
+        "--fragment-retries",
         "1",
         "--socket-timeout",
         str(YTDLP_SOCKET_TIMEOUT_S),
-        url,
     ]
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        host = ""
+    if "instagram." in host:
+        cmd.extend(["--add-header", "Referer:https://www.instagram.com/"])
+    elif "tiktok." in host:
+        cmd.extend(["--add-header", "Referer:https://www.tiktok.com/"])
+    if extra:
+        try:
+            cmd.extend(shlex.split(extra, posix=True))
+        except ValueError as e:
+            log.warning("YTDLP_EXTRA_ARGS shlex parse failed: %s", e)
+    cmd.append(url)
     t0 = time.perf_counter()
     try:
         proc = subprocess.run(
@@ -126,6 +219,8 @@ def _run_ytdlp_json(url: str) -> dict:
             capture_output=True,
             text=True,
             timeout=YTDLP_SUBPROCESS_TIMEOUT_S,
+            encoding="utf-8",
+            errors="replace",
         )
     except subprocess.TimeoutExpired:
         log.warning(
@@ -140,21 +235,61 @@ def _run_ytdlp_json(url: str) -> dict:
         err = (proc.stderr or proc.stdout or "").strip()[:500]
         log.warning("yt-dlp error: %s", err)
         return {}
-    return _extract_json_obj(proc.stdout or "")
+    raw = _extract_json_obj(proc.stdout or "")
+    if not raw and (proc.stdout or "").strip():
+        log.warning(
+            "yt-dlp JSON parse got empty dict; stdout_len=%s stderr_head=%s",
+            len(proc.stdout or ""),
+            (proc.stderr or "")[:300],
+        )
+    return _flatten_playlist_for_preview(raw)
+
+
+def _thumb_url_from_obj(obj: object) -> str:
+    if isinstance(obj, str) and obj.startswith("http"):
+        return obj
+    if isinstance(obj, dict):
+        u = obj.get("url") or obj.get("src")
+        if isinstance(u, str) and u.startswith("http"):
+            return u
+    return ""
 
 
 def _pick_thumb_url(info: dict) -> str:
-    for k in ("thumbnail", "og:image"):
-        v = info.get(k)
-        if isinstance(v, str) and v.startswith("http"):
-            return v
+    u = _thumb_url_from_obj(info.get("thumbnail"))
+    if u:
+        return u
+    og = info.get("og:image")
+    if isinstance(og, str) and og.startswith("http"):
+        return og
     thumbs = info.get("thumbnails")
-    if isinstance(thumbs, list) and thumbs:
-        last = thumbs[-1]
-        if isinstance(last, dict):
-            u = last.get("url")
-            if isinstance(u, str) and u.startswith("http"):
+    if isinstance(thumbs, list):
+        for thumb in thumbs:
+            u = _thumb_url_from_obj(thumb)
+            if u:
                 return u
+    return ""
+
+
+def _pick_title(info: dict) -> str:
+    for k in ("title", "fulltitle", "track", "alt_title"):
+        v = info.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    ch = info.get("channel") or info.get("uploader")
+    vid = info.get("id") or info.get("display_id")
+    if isinstance(ch, str) and ch.strip():
+        return f"Video by {ch.strip()}"
+    if isinstance(vid, str) and vid.strip():
+        return f"Instagram {vid.strip()}"
+    return ""
+
+
+def _pick_description(info: dict) -> str:
+    for k in ("description", "summary", "content"):
+        v = info.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
     return ""
 
 
@@ -195,10 +330,21 @@ async def v1_preview(
         raise HTTPException(status_code=400, detail="host not allowed for preview")
 
     info = await _run_ytdlp_json_async(url)
-    title = _sanitize_text(str(info.get("title") or ""), 500)
-    desc = _sanitize_text(str(info.get("description") or ""), 8000)
+    title = _sanitize_text(_pick_title(info), 500)
+    if not title and "instagram." in (urlparse(url).hostname or "").lower():
+        m = re.search(r"/(?:p|reel|reels|tv)/([^/?#]+)", url, re.I)
+        if m:
+            title = _sanitize_text(f"Instagram {m.group(1)}", 500)
+    desc = _sanitize_text(_pick_description(info), 8000)
     thumb = _pick_thumb_url(info)
     site = _sanitize_text(str(info.get("extractor") or info.get("ie_key") or ""), 120)
+
+    if not title and not desc and not thumb:
+        log.warning(
+            "[ytdlp-gateway] empty preview fields keys=%s id=%s",
+            list(info.keys())[:35],
+            info.get("id"),
+        )
 
     log.info(
         "[ytdlp-gateway] preview ok in %sms url=%s title_len=%s desc_len=%s thumb=%s",
