@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import os
@@ -29,8 +30,35 @@ ALLOWED_PREVIEW_HOSTS = frozenset(
 EDGE_SECRET = os.getenv("EDGE_SHARED_SECRET", "").strip()
 HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "20"))
 MAX_THUMB_BYTES = int(os.getenv("MAX_THUMB_BYTES", str(5 * 1024 * 1024)))
+# Keep total request time well under Railway edge limits; cold start + yt-dlp must fit.
+YTDLP_SUBPROCESS_TIMEOUT_S = int(os.getenv("YTDLP_TIMEOUT_S", "18"))
+YTDLP_SOCKET_TIMEOUT_S = int(os.getenv("YTDLP_SOCKET_TIMEOUT_S", "12"))
 
-app = FastAPI(title="Memoryan yt-dlp gateway", version="1.0.0")
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    port = os.getenv("PORT", "")
+    log.info(
+        "startup PORT=%s EDGE_SHARED_SECRET=%s",
+        port or "(unset — local default may differ from Railway)",
+        "set" if EDGE_SECRET else "MISSING",
+    )
+    try:
+        v = subprocess.run(
+            ["yt-dlp", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        out = (v.stdout or v.stderr or "").strip()
+        log.info("yt-dlp binary ok: %s", out[:120] or f"exit={v.returncode}")
+    except Exception as e:
+        log.error("yt-dlp binary check failed: %s", e)
+    yield
+
+
+app = FastAPI(title="Memoryan yt-dlp gateway", version="1.0.0", lifespan=_lifespan)
 
 
 class PreviewBody(BaseModel):
@@ -85,15 +113,27 @@ def _run_ytdlp_json(url: str) -> dict:
         "--skip-download",
         "--dump-single-json",
         "--no-playlist",
+        "--retries",
+        "1",
+        "--socket-timeout",
+        str(YTDLP_SOCKET_TIMEOUT_S),
         url,
     ]
     t0 = time.perf_counter()
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=int(os.getenv("YTDLP_TIMEOUT_S", "25")),
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=YTDLP_SUBPROCESS_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning(
+            "yt-dlp subprocess timeout after %ss url=%s",
+            YTDLP_SUBPROCESS_TIMEOUT_S,
+            url[:80],
+        )
+        return {}
     dt_ms = int((time.perf_counter() - t0) * 1000)
     log.info("yt-dlp finished in %sms exit=%s", dt_ms, proc.returncode)
     if proc.returncode != 0:
@@ -141,6 +181,8 @@ async def v1_preview(
     x_memoryan_edge_secret: str | None = Header(default=None),
     authorization: str | None = Header(default=None),
 ):
+    t_req = time.perf_counter()
+    log.info("[ytdlp-gateway] /v1/preview start url=%s", (body.url or "")[:120])
     _require_edge_secret(x_memoryan_edge_secret)
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="missing bearer")
@@ -158,7 +200,14 @@ async def v1_preview(
     thumb = _pick_thumb_url(info)
     site = _sanitize_text(str(info.get("extractor") or info.get("ie_key") or ""), 120)
 
-    log.info("[ytdlp-gateway] preview ok url=%s title_len=%s desc_len=%s thumb=%s", url, len(title), len(desc), bool(thumb))
+    log.info(
+        "[ytdlp-gateway] preview ok in %sms url=%s title_len=%s desc_len=%s thumb=%s",
+        int((time.perf_counter() - t_req) * 1000),
+        url[:120],
+        len(title),
+        len(desc),
+        bool(thumb),
+    )
 
     return JSONResponse(
         {
