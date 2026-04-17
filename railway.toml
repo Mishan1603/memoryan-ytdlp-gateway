@@ -1,0 +1,9 @@
+# https://docs.railway.com/reference/config-as-code
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+healthcheckPath = "/health"
+# First boot after deploy can be slow (image pull); avoid marking the service unhealthy too early.
+healthcheckTimeout = 45
